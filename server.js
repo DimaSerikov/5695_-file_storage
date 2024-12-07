@@ -1,113 +1,98 @@
 const express = require('express');
 const WebSocket = require('ws');
-const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const PORT = 3004;
 
-const uploadsPerIP = {};
-const fileData = [];
+const uploadDir = path.join(__dirname, 'uploads');
 
-// Limitation flow for each client
-const uploadLimitMiddleware = (req, res, next) => {
-  const clientIP = req.ip;
-  if (!uploadsPerIP[clientIP]) {
-    uploadsPerIP[clientIP] = 0;
-  }
-
-  if (uploadsPerIP[clientIP] >= 3) {
-    return res.status(429).json({ error: 'Upload limit reached (max 3 files per IP)' });
-  }
-
-  next();
-};
-
-// Refresh limits 
-setInterval(() => {
-  for (const ip in uploadsPerIP) {
-    uploadsPerIP[ip] = 0;
-  }
-}, 24 * 60 * 60 * 1000);
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadPath = path.join(__dirname, 'uploads');
-    if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath);
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => {
-    cb(null, file.originalname);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 2 * 1024 * 1024 },
-});
-
-app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File size exceeds 2MB' });
-    }
-  }
-  if (err) {
-    return res.status(500).json({ error: err.message });
-  }
-  next();
-});
-
-app.use(express.static(path.join(__dirname, 'public')));
-
-function getFileList() {
-  const uploadPath = path.join(__dirname, 'uploads');
-  if (!fs.existsSync(uploadPath)) return [];
-  return fs.readdirSync(uploadPath).map((file) => ({ name: file }));
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir);
 }
 
-app.post('/upload', uploadLimitMiddleware, upload.single('file'), (req, res) => {
-  const clientIP = req.ip;
-  uploadsPerIP[clientIP] += 1;
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(uploadDir));
 
-  const fileEntry = {
-    name: req.file.originalname,
-  };
-  fileData.push(fileEntry);
-
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({ type: 'fileList', files: fileData }));
-    }
-  });
-
-  res.json({ message: 'File uploaded successfully', fileName: req.file.originalname });
-});
-
-const server = app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-});
-
+const server = app.listen(PORT, () => console.log(`Server running on port:${PORT}`));
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
-  console.log('Client connected');
+  console.log('WebSocket client connected');
 
-  ws.send(JSON.stringify({ type: 'fileList', files: getFileList() }));
+  sendFileList(ws);
 
   ws.on('message', (message) => {
     const data = JSON.parse(message);
-    if (data.type === 'progress') {
-      ws.send(JSON.stringify({ type: 'progress', progress: data.progress }));
+
+    switch (data.type) {
+      case 'startUpload': {
+        const filePath = path.join(uploadDir, data.fileName);
+        ws.uploadStream = fs.createWriteStream(filePath);
+        ws.uploadedBytes = 0;
+        ws.totalBytes = data.totalBytes;
+        ws.fileName = data.fileName;
+        ws.comment = data.comment;
+        break;
+      }
+
+      case 'chunk': {
+        const chunk = Buffer.from(data.chunk, 'base64');
+        ws.uploadStream.write(chunk);
+        ws.uploadedBytes += chunk.length;
+
+        const progress = Math.round((ws.uploadedBytes / ws.totalBytes) * 100);
+        ws.send(JSON.stringify({ type: 'progress', progress }));
+        break;
+      }
+
+      case 'endUpload': {
+        ws.uploadStream.end();
+
+        const commentFilePath = path.join(uploadDir, `${ws.fileName}.comment.json`);
+        fs.writeFileSync(commentFilePath, JSON.stringify({ comment: ws.comment }));
+
+        console.log(`File uploaded: ${ws.fileName}`);
+        ws.send(JSON.stringify({ type: 'uploadComplete', fileName: ws.fileName }));
+
+        broadcastFileList();
+        break;
+      }
+
+      default:
+        console.error(`Unknown message type: ${data.type}`);
     }
   });
 
   ws.on('close', () => {
-    console.log('Client disconnected');
-  });
-
-  ws.on('error', (err) => {
-    console.error('WebSocket error:', err);
+    console.log('WebSocket client disconnected');
   });
 });
+
+function getFileList() {
+  return fs.readdirSync(uploadDir).filter((file) => !file.endsWith('.comment.json')).map((file) => {
+    const commentFile = path.join(uploadDir, `${file}.comment.json`);
+    const comment = fs.existsSync(commentFile) ? JSON.parse(fs.readFileSync(commentFile)).comment : '';
+
+    return { name: file, comment };
+  });
+}
+
+function broadcastFileList() {
+  const fileList = getFileList();
+  wss.clients.forEach((client) => {
+    if (client.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    client.send(JSON.stringify({ type: 'fileList', files: fileList }));
+  });
+}
+
+function sendFileList(ws) {
+  const fileList = getFileList();
+  
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'fileList', files: fileList }));
+  }
+}
